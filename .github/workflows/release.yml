@@ -1,0 +1,230 @@
+name: Release
+
+# Builds and publishes MXB Servers (MSM) and the native Linux mxbserver to this repo's releases.
+#
+# The source is in the private Frostn1/mxbserver repo (MSM is `apps/msm` there). Actions does
+# not run on that repo, so this workflow checks it out with a read-only deploy key
+# (MXBSERVER_DEPLOY_KEY), builds it and attaches only the built files to a release here.
+#
+#   msm-v0.1.0      → MSM Windows installer (NSIS), Authenticode-signed
+#   server-v0.1.0   → mxbserver Linux x86-64 binary, VERSION and SHA256SUMS
+#
+# A suffixed tag (msm-v0.2.0-beta.1) is published as a pre-release.
+#
+# Which source commit gets built: the commit tagged with the same name in Frostn1/mxbserver
+# when that tag exists there, else the tip of its main branch. The release notes name the commit.
+#
+# This repo is public and so are these logs. Nothing here prints source: no `set -x`, no
+# `cat` of checked-out files, no workflow artifacts, no build cache (a cache would hold
+# compiled private code). The release gets the installer or the binary, never the checkout.
+
+on:
+  push:
+    tags:
+      - "msm-v*"
+      - "server-v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  msm:
+    name: MXB Servers (Windows)
+    if: ${{ startsWith(github.ref_name, 'msm-v') }}
+    runs-on: windows-latest
+    # The environment gives the OIDC token one stable subject for Azure to trust
+    # (repo:Frostn1/mxbserver-releases:environment:code-signing), whatever tag started the run.
+    # No protection rules: it exists only to name the job. See README.md.
+    environment: code-signing
+    permissions:
+      contents: write # publish the release in this repo with GITHUB_TOKEN
+      id-token: write # OIDC login for code signing
+    steps:
+      # This repo: the signing action and scripts/sign-windows.ps1.
+      - name: Checkout release tooling
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Checkout mxbserver (private)
+        uses: actions/checkout@v4
+        with:
+          repository: Frostn1/mxbserver
+          ssh-key: ${{ secrets.MXBSERVER_DEPLOY_KEY }}
+          path: src
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Pick the source commit and version
+        id: meta
+        shell: bash
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          version="${TAG#msm-v}"
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
+            echo "::error::'$TAG' is not msm-v<major>.<minor>.<patch>[-pre]"
+            exit 1
+          fi
+          if git -C src rev-parse -q --verify "refs/tags/$TAG^{commit}" >/dev/null; then
+            git -C src checkout -q --detach "refs/tags/$TAG"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "sha=$(git -C src rev-parse --short=12 HEAD)" >> "$GITHUB_OUTPUT"
+          if [[ "$version" == *-* ]]; then echo "prerelease=true"; else echo "prerelease=false"; fi >> "$GITHUB_OUTPUT"
+
+      # The installer's version comes from the tag, not whatever tauri.conf.json says.
+      - name: Stamp the version
+        shell: bash
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          node -e '
+            const fs = require("fs");
+            const p = "src/apps/msm/src-tauri/tauri.conf.json";
+            const c = JSON.parse(fs.readFileSync(p, "utf8"));
+            c.version = process.env.VERSION;
+            fs.writeFileSync(p, JSON.stringify(c, null, 2) + "\n");
+          '
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install dependencies
+        working-directory: src/apps/msm
+        run: bun install --frozen-lockfile
+
+      # A tag must never publish an unsigned installer: without the Azure secrets and variables
+      # this step fails the job.
+      - name: Set up Windows code signing
+        id: signing
+        uses: ./.github/actions/artifact-signing
+        with:
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          azure-subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          endpoint: ${{ vars.ARTIFACT_SIGNING_ENDPOINT }}
+          account: ${{ vars.ARTIFACT_SIGNING_ACCOUNT }}
+          profile: ${{ vars.ARTIFACT_SIGNING_PROFILE }}
+          required: "true"
+
+      # No updater (MSM has no plugins.updater), so no latest.json and no TAURI_SIGNING_* key.
+      - name: Build, sign and publish
+        uses: tauri-apps/tauri-action@v0
+        env:
+          # Publishes to this same repo, so the job's own token is enough.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VITE_APP_NAME: "MXB Servers"
+        with:
+          projectPath: src/apps/msm
+          tauriScript: bun run tauri
+          tagName: ${{ github.ref_name }}
+          releaseName: "MXB Servers ${{ steps.meta.outputs.version }}"
+          assetNamePattern: "MXB-Servers-[version]-[arch][ext]"
+          releaseBody: |
+            MXB Servers ${{ steps.meta.outputs.version }}: the desktop manager for mxbserver.
+
+            Download `MXB-Servers-${{ steps.meta.outputs.version }}-x64-setup.exe` and run it (Windows 10/11, x64). The installer is signed by Creste LLC.
+
+            Built from mxbserver `${{ steps.meta.outputs.sha }}`.
+          releaseDraft: false
+          prerelease: ${{ steps.meta.outputs.prerelease == 'true' }}
+          # The signCommand overlay from the signing step.
+          args: ${{ steps.signing.outputs.tauri-args }}
+
+      # Tauri hides the signing command's output when it fails; sign-windows.ps1 keeps a transcript.
+      - name: Show Windows signing log
+        if: ${{ failure() }}
+        shell: pwsh
+        run: |
+          $log = Join-Path $env:RUNNER_TEMP 'sign-windows.log'
+          if (Test-Path $log) { Get-Content $log } else { Write-Host 'no sign-windows.log (the signing script never ran)' }
+
+  server:
+    name: mxbserver (Linux x86-64)
+    if: ${{ startsWith(github.ref_name, 'server-v') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # publish the release in this repo with GITHUB_TOKEN
+    steps:
+      - name: Checkout mxbserver (private)
+        uses: actions/checkout@v4
+        with:
+          repository: Frostn1/mxbserver
+          ssh-key: ${{ secrets.MXBSERVER_DEPLOY_KEY }}
+          path: src
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Pick the source commit and version
+        id: meta
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          version="${TAG#server-v}"
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
+            echo "::error::'$TAG' is not server-v<major>.<minor>.<patch>[-pre]"
+            exit 1
+          fi
+          if git -C src rev-parse -q --verify "refs/tags/$TAG^{commit}" >/dev/null; then
+            git -C src checkout -q --detach "refs/tags/$TAG"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "sha=$(git -C src rev-parse --short=12 HEAD)" >> "$GITHUB_OUTPUT"
+          if [[ "$version" == *-* ]]; then echo "prerelease=true"; else echo "prerelease=false"; fi >> "$GITHUB_OUTPUT"
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      # --quiet: one character per test, so the public log carries no list of test names.
+      - name: Test
+        working-directory: src
+        run: cargo test --workspace --locked --quiet
+
+      - name: Build
+        working-directory: src
+        run: cargo build --release --locked -p mxbserver
+
+      - name: Package
+        run: |
+          mkdir dist
+          elf=mxbserver-x86_64-unknown-linux-gnu.elf
+          cp src/target/release/mxbserver "dist/$elf"
+          file "dist/$elf" | grep -q 'ELF 64-bit.*x86-64'
+          "dist/$elf" --version > dist/VERSION
+          (cd dist && sha256sum "$elf" VERSION > SHA256SUMS)
+          cat dist/VERSION dist/SHA256SUMS
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          VERSION: ${{ steps.meta.outputs.version }}
+          SHA: ${{ steps.meta.outputs.sha }}
+          PRERELEASE: ${{ steps.meta.outputs.prerelease }}
+        run: |
+          flags=()
+          if [[ "$PRERELEASE" == "true" ]]; then flags+=(--prerelease); fi
+          notes="mxbserver $VERSION for Linux x86-64 ($(cat dist/VERSION)). Built from mxbserver \`$SHA\`. Check the download with \`sha256sum -c SHA256SUMS\`."
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --title "mxbserver $VERSION" \
+            --notes "$notes" \
+            "${flags[@]}" \
+            dist/mxbserver-x86_64-unknown-linux-gnu.elf dist/VERSION dist/SHA256SUMS
