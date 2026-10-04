@@ -40,8 +40,14 @@ What the workflow needs:
 | --- | --- | --- |
 | Secret | `MXBSERVER_DEPLOY_KEY` | Private half of a read-only deploy key on the source repo |
 | Secret | `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, `AZURE_SUBSCRIPTION_ID` | The Azure app registration used for code signing |
+| Secret | `MSM_SIGNING_PRIVATE_KEY`, `MSM_SIGNING_PRIVATE_KEY_PASSWORD` | MSM's Tauri updater key and its password. The public half is `plugins.updater.pubkey` in `apps/msm/src-tauri/tauri.conf.json` |
 | Variable | `ARTIFACT_SIGNING_ENDPOINT`, `ARTIFACT_SIGNING_ACCOUNT`, `ARTIFACT_SIGNING_PROFILE` | The Artifact Signing account and certificate profile |
 | Azure | Federated credential `repo:Frostn1/mxbserver-releases:environment:code-signing` | Lets the `code-signing` environment log in over OIDC, with no stored password |
 
 An MSM tag fails before publishing if signing is not configured, so an unsigned installer is
-never released.
+never released. It also fails if the updater key secret is missing or the app's updater public
+key is still the placeholder, so every MSM release carries a signed `latest.json`.
+
+MSM finds its updates by listing this repo's releases and taking the newest `msm-v` tag with a
+`latest.json` (betas only when the user turns them on). It does not use `releases/latest`,
+which a `server-v` release can take.
