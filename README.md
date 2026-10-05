@@ -12,8 +12,9 @@ Open [Releases](../../releases):
 | --- | --- | --- |
 | `MXB Servers x.y.z` | `MXB-Servers-x.y.z-x64-setup.exe` | Windows 10/11 x64. Signed by Creste LLC. |
 | `mxbserver x.y.z` | `mxbserver-x86_64-unknown-linux-gnu.elf`, `VERSION`, `SHA256SUMS` | Linux x86-64 servers |
+| `mxb-agent x.y.z` | `mxb-agent-windows-x64.zip` (signed exe + `install.ps1`), `mxb-agent-windows-x64.exe`, `mxb-agent-linux-x86_64`, `SHA256SUMS` | The helper next to an official MX Bikes dedicated server that MXB Servers installs and pairs |
 
-Check a server download:
+Check a server or agent download:
 
 ```sh
 sha256sum -c SHA256SUMS
@@ -27,6 +28,7 @@ sha256sum -c SHA256SUMS
 | --- | --- |
 | `msm-v0.1.0` | MXB Servers: NSIS installer, Authenticode-signed with Azure Artifact Signing |
 | `server-v0.1.0` | mxbserver: `cargo build --release --locked -p mxbserver` on Ubuntu |
+| `agent-v0.1.0` | mxb-agent (`apps/agent`): Windows x64 exe Authenticode-signed and zipped with `install.ps1`, Linux x86-64 binary, `SHA256SUMS` over all of them. The tag's version must match `apps/agent/Cargo.toml`. The release stays a draft until every file and `SHA256SUMS` are attached |
 
 A tag with a suffix (`msm-v0.2.0-beta.1`) is published as a pre-release.
 

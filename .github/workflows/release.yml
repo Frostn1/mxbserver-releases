@@ -9,6 +9,8 @@ name: Release
 #   msm-v0.1.0      → MSM Windows installer (NSIS), Authenticode-signed, plus the updater's
 #                     signature (.sig) and a signed latest.json
 #   server-v0.1.0   → mxbserver Linux x86-64 binary, VERSION and SHA256SUMS
+#   agent-v0.1.0    → mxb-agent: Windows x64 exe (Authenticode-signed), a zip of it with
+#                     install.ps1, a Linux x86-64 binary, and SHA256SUMS over all three
 #
 # A suffixed tag (msm-v0.2.0-beta.1) is published as a pre-release.
 #
@@ -30,6 +32,7 @@ on:
     tags:
       - "msm-v*"
       - "server-v*"
+      - "agent-v*"
 
 permissions:
   contents: read
@@ -265,3 +268,181 @@ jobs:
             --notes "$notes" \
             "${flags[@]}" \
             dist/mxbserver-x86_64-unknown-linux-gnu.elf dist/VERSION dist/SHA256SUMS
+
+  # mxb-agent (apps/agent in the source). The Windows job builds and signs the exe, packs the
+  # zip, and creates the release as a draft; the Linux job adds its binary and SHA256SUMS over
+  # every file, then publishes it. MSM only takes a published release that has SHA256SUMS, so a
+  # half-made release is never installed. The tag's version must match apps/agent/Cargo.toml.
+  agent-windows:
+    name: mxb-agent (Windows x64)
+    if: ${{ startsWith(github.ref_name, 'agent-v') }}
+    runs-on: windows-latest
+    environment: code-signing
+    permissions:
+      contents: write # create the release in this repo with GITHUB_TOKEN
+      id-token: write # OIDC login for code signing
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      sha: ${{ steps.meta.outputs.sha }}
+      prerelease: ${{ steps.meta.outputs.prerelease }}
+    steps:
+      - name: Checkout release tooling
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Checkout mxbserver (private)
+        uses: actions/checkout@v4
+        with:
+          repository: Frostn1/mxbserver
+          ssh-key: ${{ secrets.MXBSERVER_DEPLOY_KEY }}
+          path: src
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Pick the source commit and version
+        id: meta
+        shell: bash
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          version="${TAG#agent-v}"
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
+            echo "::error::'$TAG' is not agent-v<major>.<minor>.<patch>[-pre]"
+            exit 1
+          fi
+          if git -C src rev-parse -q --verify "refs/tags/$TAG^{commit}" >/dev/null; then
+            git -C src checkout -q --detach "refs/tags/$TAG"
+          fi
+          crate=$(grep -m1 '^version = ' src/apps/agent/Cargo.toml | cut -d'"' -f2)
+          if [[ "$crate" != "$version" ]]; then
+            echo "::error::apps/agent/Cargo.toml says $crate; bump it (and Cargo.lock) to $version before tagging"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "sha=$(git -C src rev-parse --short=12 HEAD)" >> "$GITHUB_OUTPUT"
+          if [[ "$version" == *-* ]]; then echo "prerelease=true"; else echo "prerelease=false"; fi >> "$GITHUB_OUTPUT"
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      # --quiet: one character per test, so the public log carries no list of test names.
+      - name: Test
+        working-directory: src/apps/agent
+        run: cargo test --locked --quiet
+
+      - name: Build
+        working-directory: src/apps/agent
+        run: cargo build --release --locked --bin mxb-agent
+
+      - name: Set up Windows code signing
+        uses: ./.github/actions/artifact-signing
+        with:
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          azure-subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          endpoint: ${{ vars.ARTIFACT_SIGNING_ENDPOINT }}
+          account: ${{ vars.ARTIFACT_SIGNING_ACCOUNT }}
+          profile: ${{ vars.ARTIFACT_SIGNING_PROFILE }}
+          required: "true"
+
+      # The exe is signed before it is zipped and hashed, so the zip and SHA256SUMS carry the
+      # signed bytes. A release never ships an unsigned agent.
+      - name: Sign and package
+        shell: pwsh
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          New-Item -ItemType Directory dist, pack | Out-Null
+          Copy-Item src/apps/agent/target/release/mxb-agent.exe dist/mxb-agent-windows-x64.exe
+          ./scripts/sign-windows.ps1 dist/mxb-agent-windows-x64.exe
+          $sig = Get-AuthenticodeSignature dist/mxb-agent-windows-x64.exe
+          if ($sig.Status -ne 'Valid') { throw "mxb-agent-windows-x64.exe is not validly signed: $($sig.Status)" }
+          Copy-Item dist/mxb-agent-windows-x64.exe pack/mxb-agent.exe
+          Copy-Item src/apps/agent/dist/install.ps1 pack/install.ps1
+          @"
+          mxb-agent $env:VERSION for Windows x64
+
+          Run install.ps1 (right-click > Run with PowerShell, or:
+            powershell -ExecutionPolicy Bypass -File install.ps1 -GameDir "C:\MX Bikes" -OpenFirewall)
+          It installs the mxb-agent service and prints a pairing line (mxb-agent:...).
+          Paste that line into MXB Servers: Edit server > mxb-agent > Remote Desktop.
+          "@ | Set-Content -Encoding utf8 pack/README.txt
+          Compress-Archive -Path pack/* -DestinationPath dist/mxb-agent-windows-x64.zip
+
+      - name: Create the release (draft)
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          VERSION: ${{ steps.meta.outputs.version }}
+          SHA: ${{ steps.meta.outputs.sha }}
+          PRERELEASE: ${{ steps.meta.outputs.prerelease }}
+        run: |
+          flags=()
+          if [[ "$PRERELEASE" == "true" ]]; then flags+=(--prerelease); fi
+          notes="mxb-agent $VERSION: runs an MX Bikes dedicated server and lets MXB Servers manage it (track changes, track uploads, dedicated.ini, logs, start/stop). Windows: \`mxb-agent-windows-x64.zip\` (signed by Creste LLC, with install.ps1). Linux x86-64: \`mxb-agent-linux-x86_64\` (\`sudo ./mxb-agent-linux-x86_64 install --game-dir <folder>\`). MXB Servers can install it for you (Edit server > mxb-agent). Check downloads with \`sha256sum -c SHA256SUMS\`. Built from mxbserver \`$SHA\`."
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --draft \
+            --title "mxb-agent $VERSION" \
+            --notes "$notes" \
+            "${flags[@]}" \
+            dist/mxb-agent-windows-x64.exe dist/mxb-agent-windows-x64.zip
+
+      - name: Show Windows signing log
+        if: ${{ failure() }}
+        shell: pwsh
+        run: |
+          $log = Join-Path $env:RUNNER_TEMP 'sign-windows.log'
+          if (Test-Path $log) { Get-Content $log } else { Write-Host 'no sign-windows.log (the signing script never ran)' }
+
+  agent-linux:
+    name: mxb-agent (Linux x86-64) and publish
+    needs: agent-windows
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # add to and publish the release with GITHUB_TOKEN
+    steps:
+      - name: Checkout mxbserver (private)
+        uses: actions/checkout@v4
+        with:
+          repository: Frostn1/mxbserver
+          ssh-key: ${{ secrets.MXBSERVER_DEPLOY_KEY }}
+          path: src
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Pick the source commit
+        env:
+          TAG: ${{ github.ref_name }}
+          SHA: ${{ needs.agent-windows.outputs.sha }}
+        run: |
+          git -C src checkout -q --detach "$SHA"
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Test
+        working-directory: src/apps/agent
+        run: cargo test --locked --quiet
+
+      - name: Build
+        working-directory: src/apps/agent
+        run: cargo build --release --locked --bin mxb-agent
+
+      - name: Package and publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          mkdir dist
+          cp src/apps/agent/target/release/mxb-agent dist/mxb-agent-linux-x86_64
+          file dist/mxb-agent-linux-x86_64 | grep -q 'ELF 64-bit.*x86-64'
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir dist \
+            --pattern mxb-agent-windows-x64.exe --pattern mxb-agent-windows-x64.zip
+          (cd dist && sha256sum mxb-agent-windows-x64.exe mxb-agent-windows-x64.zip mxb-agent-linux-x86_64 > SHA256SUMS)
+          cat dist/SHA256SUMS
+          gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" dist/mxb-agent-linux-x86_64 dist/SHA256SUMS
+          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false
