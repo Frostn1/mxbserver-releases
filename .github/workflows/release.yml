@@ -199,6 +199,12 @@ jobs:
     permissions:
       contents: write # publish the release in this repo with GITHUB_TOKEN
     steps:
+      # This repo: minisign.pub, to check our own signature.
+      - name: Checkout release tooling
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
       - name: Checkout mxbserver (private)
         uses: actions/checkout@v4
         with:
@@ -207,6 +213,21 @@ jobs:
           path: src
           fetch-depth: 0
           persist-credentials: false
+
+      # Checked by presence only; the values are never printed.
+      - name: Check the minisign key
+        env:
+          KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+          PASSWORD: ${{ secrets.MINISIGN_PASSWORD }}
+        run: |
+          if [[ -z "$KEY" ]]; then
+            echo "::error::secret MINISIGN_SECRET_KEY is not set (see README.md)"
+            exit 1
+          fi
+          if [[ -z "$PASSWORD" ]]; then
+            echo "::error::secret MINISIGN_PASSWORD is not set (see README.md)"
+            exit 1
+          fi
 
       - name: Pick the source commit and version
         id: meta
@@ -248,7 +269,43 @@ jobs:
           file "dist/$elf" | grep -q 'ELF 64-bit.*x86-64'
           "dist/$elf" --version > dist/VERSION
           (cd dist && sha256sum "$elf" VERSION > SHA256SUMS)
+          # Bike-set manifests: ids and check words only, no licensed payload. Box installs take
+          # them from here. They are listed in SHA256SUMS, so the signature covers them.
+          if compgen -G "src/config/bike-sets/*.toml" >/dev/null; then
+            cp src/config/bike-sets/*.toml dist/
+            (cd dist && sha256sum oem-*.toml >> SHA256SUMS)
+          fi
           cat dist/VERSION dist/SHA256SUMS
+
+      # SHA256SUMS.minisig is the signature `mxbserver ctl update` expects: it must verify under
+      # the release key and carry the trusted comment `mxbserver <tag> <commit>`. The key and
+      # password go through files and stdin only: no echo, no set -x, removed afterwards.
+      - name: Sign
+        env:
+          KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+          PASSWORD: ${{ secrets.MINISIGN_PASSWORD }}
+          TAG: ${{ github.ref_name }}
+          SHA: ${{ steps.meta.outputs.sha }}
+        run: |
+          set +x
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq minisign >/dev/null
+          keyfile="$RUNNER_TEMP/minisign.key"
+          (umask 077; printf '%s\n' "$KEY" > "$keyfile")
+          trap 'rm -f "$keyfile"' EXIT
+          elf=mxbserver-x86_64-unknown-linux-gnu.elf
+          comment="mxbserver $TAG $SHA"
+          for f in SHA256SUMS "$elf"; do
+            printf '%s\n' "$PASSWORD" | minisign -S -s "$keyfile" -m "dist/$f" -x "dist/$f.minisig" \
+              -c "mxbserver release signature" -t "$comment" >/dev/null
+          done
+          if [[ -f minisign.pub ]]; then
+            minisign -V -p minisign.pub -m dist/SHA256SUMS -x dist/SHA256SUMS.minisig >/dev/null
+            minisign -V -p minisign.pub -m "dist/$elf" -x "dist/$elf.minisig" >/dev/null
+            echo "signatures verify against minisign.pub"
+          else
+            echo "::warning::minisign.pub is not committed; signatures were not self-checked"
+          fi
 
       - name: Publish
         env:
@@ -260,14 +317,14 @@ jobs:
         run: |
           flags=()
           if [[ "$PRERELEASE" == "true" ]]; then flags+=(--prerelease); fi
-          notes="mxbserver $VERSION for Linux x86-64 ($(cat dist/VERSION)). Built from mxbserver \`$SHA\`. Check the download with \`sha256sum -c SHA256SUMS\`."
+          notes="mxbserver $VERSION for Linux x86-64 ($(cat dist/VERSION)). Built from mxbserver \`$SHA\`. Check the download with \`sha256sum -c SHA256SUMS\` and \`minisign -V -p minisign.pub -m SHA256SUMS\`."
           gh release create "$TAG" \
             --repo "$GITHUB_REPOSITORY" \
             --verify-tag \
             --title "mxbserver $VERSION" \
             --notes "$notes" \
             "${flags[@]}" \
-            dist/mxbserver-x86_64-unknown-linux-gnu.elf dist/VERSION dist/SHA256SUMS
+            dist/mxbserver-x86_64-unknown-linux-gnu.elf dist/mxbserver-x86_64-unknown-linux-gnu.elf.minisig             dist/VERSION dist/SHA256SUMS dist/SHA256SUMS.minisig dist/*.toml
 
   # mxb-agent (apps/agent in the source). The Windows job builds and signs the exe, packs the
   # zip, and creates the release as a draft; the Linux job adds its binary and SHA256SUMS over
