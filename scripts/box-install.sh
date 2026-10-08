@@ -1,13 +1,16 @@
 #!/usr/bin/env bash
-# box-install.sh: set up a fresh OVH Debian 12 VPS as a hosted-server box.
+# box-install.sh: set up a freshly rebuilt OVH VPS as a hosted-server box.
 #
 # Public script, no secrets. Run as the default sudo user (sudo is used inside; the user
-# must have passwordless sudo, as OVH's `debian` user does). The control plane reads the
+# must have passwordless sudo, as OVH's `ubuntu` and `debian` users do). The control plane reads the
 # tokens this script writes under /root/mxb-enroll/ and then deletes that folder.
 #
 #   box-install.sh --pool native|legacy --slots N --pubkey-file minisign.pub \
 #       [--release-repo Frostn1/mxbserver-releases] [--ip 1.2.3.4] \
-#       [--tracks-json tracks.json] [--game-url URL] [--dry-run]
+#       [--tracks-json tracks.json] [--game-url URL] [--admin-keys-file keys] [--dry-run]
+#
+# --admin-keys-file: operator SSH public keys, one per line, added to the running user's
+# authorized_keys so an operator can log in next to the install key.
 #
 # native: minisign-verified server-v* release, one mxbserver@sN unit per slot, Caddy in front.
 # legacy: Wine + PiBoSo's dedicated-server download + mxb-agent (agent-v*) with N instances.
@@ -24,7 +27,7 @@ set -euo pipefail
 umask 077
 
 POOL=""; SLOTS=""; REPO="Frostn1/mxbserver-releases"; PUBKEY=""; IP=""
-TRACKS_JSON=""; GAME_URL=""; DRY=0
+TRACKS_JSON=""; GAME_URL=""; ADMIN_KEYS=""; DRY=0
 
 die() { echo "box-install: $*" >&2; exit 1; }
 say() { echo "== $*"; }
@@ -38,8 +41,9 @@ while [[ $# -gt 0 ]]; do
     --ip) IP="${2:-}"; shift 2 ;;
     --tracks-json) TRACKS_JSON="${2:-}"; shift 2 ;;
     --game-url) GAME_URL="${2:-}"; shift 2 ;;
+    --admin-keys-file) ADMIN_KEYS="${2:-}"; shift 2 ;;
     --dry-run) DRY=1; shift ;;
-    -h|--help) sed -n 2,22p "$0"; exit 0 ;;
+    -h|--help) sed -n 2,25p "$0"; exit 0 ;;
     *) die "unknown argument: $1" ;;
   esac
 done
@@ -52,6 +56,7 @@ done
 [[ "$DRY" == 1 || -f "$PUBKEY" ]] || die "--pubkey-file $PUBKEY not found"
 [[ -z "$TRACKS_JSON" || "$DRY" == 1 || -f "$TRACKS_JSON" ]] || die "--tracks-json $TRACKS_JSON not found"
 if [[ "$POOL" == legacy && -z "$GAME_URL" ]]; then die "--game-url is required for --pool legacy"; fi
+[[ -z "$ADMIN_KEYS" || "$DRY" == 1 || -f "$ADMIN_KEYS" ]] || die "--admin-keys-file $ADMIN_KEYS not found"
 
 ENROLL=/root/mxb-enroll
 TRACKS_DIR=/etc/mxbserver/tracks
@@ -413,4 +418,24 @@ else
   trap 'rm -rf "$TMP"' EXIT
 fi
 
+# admin_keys: append each public key line of --admin-keys-file to this user's authorized_keys,
+# once. Lines that aren't a public key are skipped.
+admin_keys() {
+  [[ -n "$ADMIN_KEYS" ]] || return 0
+  say "operator ssh keys"
+  local auth="$HOME/.ssh/authorized_keys" line n=0
+  if [[ "$DRY" == 1 ]]; then echo "+ append keys from $ADMIN_KEYS to $auth"; return; fi
+  mkdir -p "$HOME/.ssh"
+  chmod 700 "$HOME/.ssh"
+  touch "$auth"
+  chmod 600 "$auth"
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line%$'\r'}"
+    [[ "$line" =~ ^(ssh-(ed25519|rsa)|ecdsa-sha2-nistp(256|384|521)|sk-[a-z0-9@.-]+)\ [A-Za-z0-9+/=]+(\ .*)?$ ]] || continue
+    grep -qxF -- "$line" "$auth" || { printf '%s\n' "$line" >>"$auth"; n=$((n + 1)); }
+  done <"$ADMIN_KEYS"
+  echo "added $n key(s)"
+}
+
+admin_keys
 if [[ "$POOL" == native ]]; then install_native; else install_legacy; fi
