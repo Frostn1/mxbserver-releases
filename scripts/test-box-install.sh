@@ -39,6 +39,21 @@ for want in "wine64" "7z x" "agent.token" "mxb-agent install" "ufw allow 54211/u
 done
 echo "ok  legacy dry-run"
 
+plan=$(bash "$S" --pool native --slots 1 --pubkey-file minisign.pub --admin-keys-file keys --dry-run)
+grep -qF "append keys from keys" <<<"$plan" || fail "native plan lacks the admin keys step"
+# admin_keys for real, in a scratch HOME: valid keys once each, the rest skipped.
+scratch=$(mktemp -d)
+printf 'ssh-ed25519 AAAAone a@b\r\nnot a key\nssh-ed25519 AAAAone a@b\nssh-rsa AAAAtwo==' >"$scratch/keys"
+(
+  eval "$(sed -n '/^admin_keys() {/,/^}/p' "$S")"
+  say() { :; }
+  HOME="$scratch" ADMIN_KEYS="$scratch/keys" DRY=0
+  admin_keys && admin_keys
+) >/dev/null
+[[ "$(cat "$scratch/.ssh/authorized_keys")" == $'ssh-ed25519 AAAAone a@b\nssh-rsa AAAAtwo==' ]] || fail "admin keys not added once each"
+rm -rf "$scratch"
+echo "ok  admin keys"
+
 # No token or secret may appear in the plans.
 if grep -Eq '[0-9a-f]{40,}' <<<"$native$legacy"; then fail "long hex string in dry-run output"; fi
 echo "all box-install checks passed"
