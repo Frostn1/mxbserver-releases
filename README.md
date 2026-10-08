@@ -11,13 +11,20 @@ Open [Releases](../../releases):
 | Release | File | For |
 | --- | --- | --- |
 | `MXB Servers x.y.z` | `MXB-Servers-x.y.z-x64-setup.exe` | Windows 10/11 x64. Signed by Creste LLC. |
-| `mxbserver x.y.z` | `mxbserver-x86_64-unknown-linux-gnu.elf`, `VERSION`, `SHA256SUMS` | Linux x86-64 servers |
+| `mxbserver x.y.z` | `mxbserver-x86_64-unknown-linux-gnu.elf` (+ `.minisig`), `VERSION`, `SHA256SUMS`, `SHA256SUMS.minisig`, `oem-*.toml` bike sets | Linux x86-64 servers |
 | `mxb-agent x.y.z` | `mxb-agent-windows-x64.zip` (signed exe + `install.ps1`), `mxb-agent-windows-x64.exe`, `mxb-agent-linux-x86_64`, `SHA256SUMS` | The helper next to an official MX Bikes dedicated server that MXB Servers installs and pairs |
 
 Check a server or agent download:
 
 ```sh
 sha256sum -c SHA256SUMS
+```
+
+`server-v*` releases are ordinary **public** releases (never drafts), signed with minisign.
+Verify with the public key `minisign.pub` at the root of this repo:
+
+```sh
+minisign -V -p minisign.pub -m SHA256SUMS -x SHA256SUMS.minisig
 ```
 
 ## How releases are made (maintainers)
@@ -53,3 +60,34 @@ key is still the placeholder, so every MSM release carries a signed `latest.json
 MSM finds its updates by listing this repo's releases and taking the newest `msm-v` tag with a
 `latest.json` (betas only when the user turns them on). It does not use `releases/latest`,
 which a `server-v` release can take.
+
+## Signing server releases (minisign)
+
+A `server-v*` tag signs `SHA256SUMS` (the file `mxbserver ctl update` verifies, as
+`SHA256SUMS.minisig`) and the Linux binary, with the trusted comment `mxbserver <tag> <commit>`.
+The job fails if the secrets are missing. If `minisign.pub` is committed at the repo root, the
+job verifies its own signatures against it before publishing.
+
+Create the key pair once (on a machine you trust):
+
+```sh
+minisign -G -p minisign.pub -s minisign.key     # choose a password
+```
+
+1. Commit `minisign.pub` at the repo root. Copy it to `/etc/mxbserver/release.pub` on servers that use `ctl update`.
+2. Set the secret `MINISIGN_SECRET_KEY` to the full contents of `minisign.key`, and `MINISIGN_PASSWORD` to its password.
+3. Keep `minisign.key` out of every repo.
+
+## Hosted boxes
+
+`scripts/box-install.sh` turns a fresh OVH Debian 12 VPS into a box (native: signed `mxbserver`
+release, one `mxbserver@sN` unit and Caddy route per slot; legacy: Wine plus `mxb-agent`, a
+trial). `.github/workflows/box-install.yml` runs it over SSH when the control plane dispatches
+it, reads the tokens back without printing them and enrolls them. Try the script safely with
+`bash scripts/test-box-install.sh` (syntax, shellcheck if installed, `--dry-run` plans).
+
+| Kind | Name | What |
+| --- | --- | --- |
+| Secret | `MINISIGN_SECRET_KEY`, `MINISIGN_PASSWORD` | Release signing key and password (above) |
+| Secret | `BOX_SSH_PRIVATE_KEY` | Private half of the SSH key the control plane installs on new boxes (`MXB_HOST_SSH_PUBLIC_KEY`); logs in as `debian` |
+| Secret | `MXB_BOX_ENROLL_KEY` | Bearer key for the control plane's `/v1/hosting/boxes/*` and `/v1/hosting/tracks` endpoints |

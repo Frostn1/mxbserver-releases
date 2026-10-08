@@ -1,0 +1,175 @@
+name: Box install
+
+# Installs a freshly rebuilt OVH VPS as a hosted-server box. Dispatched by the control plane
+# (api.mxbsecure.com) after it rebuilds the VPS with our SSH public key.
+#
+# The runner SSHes in as the image's login user (`user`), runs scripts/box-install.sh, adds the
+# operator keys (`admin_keys`, public keys) to that user, reads the per-slot tokens back
+# over SSH and posts them to the control plane. This repo and its logs are public: tokens go
+# straight from ssh into shell variables that are masked first, are written only to a 0600
+# file in RUNNER_TEMP for the curl body, and are never echoed. No `set -x`.
+#
+# Secrets: BOX_SSH_PRIVATE_KEY (private half of MXB_HOST_SSH_PUBLIC_KEY), MXB_BOX_ENROLL_KEY.
+
+on:
+  workflow_dispatch:
+    inputs:
+      box_id:
+        description: Control plane box id
+        required: true
+        type: string
+      ip:
+        description: Box IPv4 address
+        required: true
+        type: string
+      pool:
+        description: native (mxbserver) or legacy (Wine + mxb-agent)
+        required: true
+        type: choice
+        options: [native, legacy]
+      slots:
+        description: Number of server slots
+        required: true
+        type: string
+      game_url:
+        description: PiBoSo dedicated-server download URL (legacy only)
+        required: false
+        type: string
+      user:
+        description: The image's login user
+        required: false
+        default: ubuntu
+        type: string
+      admin_keys:
+        description: Operator SSH public keys, one per line
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: box-install-${{ inputs.box_id }}
+  cancel-in-progress: false
+
+jobs:
+  install:
+    name: Install box
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      API: https://api.mxbsecure.com
+      BOX_ID: ${{ inputs.box_id }}
+      BOX_IP: ${{ inputs.ip }}
+      POOL: ${{ inputs.pool }}
+      SLOTS: ${{ inputs.slots }}
+      GAME_URL: ${{ inputs.game_url }}
+      BOX_USER: ${{ inputs.user }}
+      ADMIN_KEYS: ${{ inputs.admin_keys }}
+      MXB_BOX_ENROLL_KEY: ${{ secrets.MXB_BOX_ENROLL_KEY }}
+      BOX_SSH_PRIVATE_KEY: ${{ secrets.BOX_SSH_PRIVATE_KEY }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Check inputs and secrets
+        run: |
+          [[ "$BOX_ID" =~ ^[A-Za-z0-9_-]{1,64}$ ]] || { echo "::error::bad box_id"; exit 1; }
+          [[ "$BOX_IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::bad ip"; exit 1; }
+          [[ "$BOX_USER" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] || { echo "::error::bad user"; exit 1; }
+          [[ "$SLOTS" =~ ^[0-9]+$ && "$SLOTS" -ge 1 && "$SLOTS" -le 20 ]] || { echo "::error::slots must be 1-20"; exit 1; }
+          if [[ "$POOL" == legacy && -z "$GAME_URL" ]]; then echo "::error::game_url is required for legacy"; exit 1; fi
+          [[ -n "$MXB_BOX_ENROLL_KEY" ]] || { echo "::error::secret MXB_BOX_ENROLL_KEY is not set"; exit 1; }
+          [[ -n "$BOX_SSH_PRIVATE_KEY" ]] || { echo "::error::secret BOX_SSH_PRIVATE_KEY is not set"; exit 1; }
+          [[ -f minisign.pub ]] || { echo "::error::minisign.pub is not committed in this repo"; exit 1; }
+
+      - name: Prepare SSH
+        run: |
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          (umask 077; printf '%s\n' "$BOX_SSH_PRIVATE_KEY" > "$RUNNER_TEMP/box_key")
+          # Trust on first use: the box was just rebuilt, so its host key is new.
+          for _ in 1 2 3 4 5 6; do
+            ssh-keyscan -T 10 -t ed25519,rsa "$BOX_IP" >> ~/.ssh/known_hosts 2>/dev/null && break
+            sleep 10
+          done
+          grep -q "$BOX_IP" ~/.ssh/known_hosts || { echo "::error::no SSH host key from $BOX_IP"; exit 1; }
+
+      - name: Stage installing
+        run: |
+          curl -fsS -X POST "$API/v1/hosting/boxes/$BOX_ID/stage" \
+            -H "Authorization: Bearer $MXB_BOX_ENROLL_KEY" -H 'Content-Type: application/json' \
+            -d '{"stage":"installing","ok":true}' >/dev/null
+
+      - name: Fetch track list
+        run: |
+          curl -fsS "$API/v1/hosting/tracks?pool=$POOL" \
+            -H "Authorization: Bearer $MXB_BOX_ENROLL_KEY" -o "$RUNNER_TEMP/tracks.json"
+          jq -e '.tracks | type == "array"' "$RUNNER_TEMP/tracks.json" >/dev/null
+
+      - name: Run the installer on the box
+        run: |
+          set -o pipefail
+          ssh_opts=(-i "$RUNNER_TEMP/box_key" -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o ServerAliveInterval=30)
+          printf '%s\n' "$ADMIN_KEYS" > "$RUNNER_TEMP/admin_keys"
+          home="/home/$BOX_USER"
+          scp "${ssh_opts[@]}" scripts/box-install.sh minisign.pub "$RUNNER_TEMP/tracks.json" "$RUNNER_TEMP/admin_keys" "$BOX_USER@$BOX_IP:$home/"
+          args=(--pool "$POOL" --slots "$SLOTS" --release-repo "$GITHUB_REPOSITORY" --ip "$BOX_IP"
+                --pubkey-file "$home/minisign.pub" --tracks-json "$home/tracks.json" --admin-keys-file "$home/admin_keys")
+          if [[ -n "$GAME_URL" ]]; then args+=(--game-url "$GAME_URL"); fi
+          # printf %q so every argument reaches the box as one word.
+          # The output (no secrets in it by design) is kept for the failure report.
+          ssh "${ssh_opts[@]}" "$BOX_USER@$BOX_IP" "bash $home/box-install.sh $(printf '%q ' "${args[@]}")" 2>&1 | tee "$RUNNER_TEMP/install.log"
+
+      - name: Enroll the slots
+        run: |
+          ssh_opts=(-i "$RUNNER_TEMP/box_key" -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes)
+          slots='[]'
+          agent_token=''
+          if [[ "$POOL" == native ]]; then
+            for ((i = 1; i <= SLOTS; i++)); do
+              tok=$(ssh "${ssh_opts[@]}" "$BOX_USER@$BOX_IP" "sudo cat /root/mxb-enroll/s$i.token")
+              [[ -n "$tok" ]] || { echo "::error::no token for slot $i"; exit 1; }
+              echo "::add-mask::$tok"
+              slots=$(jq -c --argjson i "$i" --arg t "$tok" '. + [{index:$i, gamePort:(54209+$i), token:$t}]' <<<"$slots")
+            done
+          else
+            agent_token=$(ssh "${ssh_opts[@]}" "$BOX_USER@$BOX_IP" "sudo cat /root/mxb-enroll/agent.token")
+            [[ -n "$agent_token" ]] || { echo "::error::no agent token"; exit 1; }
+            echo "::add-mask::$agent_token"
+            for ((i = 1; i <= SLOTS; i++)); do
+              slots=$(jq -c --argjson i "$i" '. + [{index:$i, gamePort:(54209+$i)}]' <<<"$slots")
+            done
+          fi
+          body="$RUNNER_TEMP/enroll.json"
+          (umask 077; jq -n --argjson s "$slots" --arg a "$agent_token" \
+            'if $a == "" then {slots:$s} else {slots:$s, agentToken:$a} end' > "$body")
+          curl -fsS -X POST "$API/v1/hosting/boxes/$BOX_ID/enroll" \
+            -H "Authorization: Bearer $MXB_BOX_ENROLL_KEY" -H 'Content-Type: application/json' \
+            --data-binary @"$body" >/dev/null
+          rm -f "$body"
+          unset tok agent_token slots
+          echo "enrolled $SLOTS slot(s)"
+
+      - name: Remove the token files from the box
+        run: |
+          ssh -i "$RUNNER_TEMP/box_key" -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes \
+            "$BOX_USER@$BOX_IP" "sudo rm -rf /root/mxb-enroll"
+
+      - name: Report failure
+        if: ${{ failure() }}
+        run: |
+          # Best effort: never leave tokens on a box that failed after they were made.
+          ssh -i "$RUNNER_TEMP/box_key" -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o ConnectTimeout=15 \
+            "$BOX_USER@$BOX_IP" "sudo rm -rf /root/mxb-enroll" >/dev/null 2>&1 || true
+          log=""
+          if [[ -f "$RUNNER_TEMP/install.log" ]]; then log=$(tail -n 50 "$RUNNER_TEMP/install.log"); fi
+          jq -n --arg l "$log" '{stage:"failed", ok:false, log:$l}' > "$RUNNER_TEMP/fail.json"
+          curl -sS -X POST "$API/v1/hosting/boxes/$BOX_ID/stage" \
+            -H "Authorization: Bearer $MXB_BOX_ENROLL_KEY" -H 'Content-Type: application/json' \
+            --data-binary @"$RUNNER_TEMP/fail.json" >/dev/null || true
+
+      - name: Remove the SSH key
+        if: ${{ always() }}
+        run: rm -f "$RUNNER_TEMP/box_key" "$RUNNER_TEMP/enroll.json" "$RUNNER_TEMP/admin_keys"
