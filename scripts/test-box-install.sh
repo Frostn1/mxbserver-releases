@@ -57,3 +57,15 @@ echo "ok  admin keys"
 # No token or secret may appear in the plans.
 if grep -Eq '[0-9a-f]{40,}' <<<"$native$legacy"; then fail "long hex string in dry-run output"; fi
 echo "all box-install checks passed"
+
+# box-update.sh: syntax, argument checks, and a plan that swaps the binary and restarts nothing.
+U=./box-update.sh
+bash -n "$U" && echo "ok  box-update bash -n"
+if bash "$U" --dry-run >/dev/null 2>&1; then fail "box-update should need --pubkey-file"; fi
+if bash "$U" --pubkey-file x --tag v1 --dry-run >/dev/null 2>&1; then fail "box-update should reject tag v1"; fi
+update=$(bash "$U" --pubkey-file minisign.pub --tag server-v1.2.3 --dry-run)
+for want in "minisign -V" "/usr/local/bin/.mxbserver.new" "mv -f /usr/local/bin/.mxbserver.new /usr/local/bin/mxbserver" "installed server-v1.2.3"; do
+  grep -qF -- "$want" <<<"$update" || fail "box-update plan lacks: $want"
+done
+if grep -q "systemctl" <<<"$update"; then fail "box-update must not restart anything"; fi
+echo "all box-update checks passed"

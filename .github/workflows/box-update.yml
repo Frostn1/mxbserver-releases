@@ -1,0 +1,97 @@
+name: Box update
+
+# Puts a newer signed mxbserver on a native hosted box (scripts/box-update.sh). Dispatched by the
+# control plane (api.mxbsecure.com) when a new server-v* release is published. Nothing is
+# restarted here: the control plane restarts each slot once it is empty, then reports on the box.
+#
+# Public repo and logs: no tokens are read or printed. Secrets: BOX_SSH_PRIVATE_KEY,
+# MXB_BOX_ENROLL_KEY (only to report the installed tag back).
+
+on:
+  workflow_dispatch:
+    inputs:
+      box_id:
+        description: Control plane box id
+        required: true
+        type: string
+      ip:
+        description: Box IPv4 address
+        required: true
+        type: string
+      tag:
+        description: server-v* release to install (empty = newest published)
+        required: false
+        type: string
+      user:
+        description: The image's login user
+        required: false
+        default: ubuntu
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  # Same group as Box install: never both on one box at once.
+  group: box-install-${{ inputs.box_id }}
+  cancel-in-progress: false
+
+jobs:
+  update:
+    name: Update box
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      API: https://api.mxbsecure.com
+      BOX_ID: ${{ inputs.box_id }}
+      BOX_IP: ${{ inputs.ip }}
+      TAG: ${{ inputs.tag }}
+      BOX_USER: ${{ inputs.user }}
+      MXB_BOX_ENROLL_KEY: ${{ secrets.MXB_BOX_ENROLL_KEY }}
+      BOX_SSH_PRIVATE_KEY: ${{ secrets.BOX_SSH_PRIVATE_KEY }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Check inputs and secrets
+        run: |
+          [[ "$BOX_ID" =~ ^[A-Za-z0-9_-]{1,64}$ ]] || { echo "::error::bad box_id"; exit 1; }
+          [[ "$BOX_IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::bad ip"; exit 1; }
+          [[ "$BOX_USER" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] || { echo "::error::bad user"; exit 1; }
+          [[ -z "$TAG" || "$TAG" =~ ^server-v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] || { echo "::error::bad tag"; exit 1; }
+          [[ -n "$BOX_SSH_PRIVATE_KEY" ]] || { echo "::error::secret BOX_SSH_PRIVATE_KEY is not set"; exit 1; }
+          [[ -f minisign.pub ]] || { echo "::error::minisign.pub is not committed in this repo"; exit 1; }
+
+      - name: Prepare SSH
+        run: |
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          (umask 077; printf '%s\n' "$BOX_SSH_PRIVATE_KEY" > "$RUNNER_TEMP/box_key")
+          ssh-keyscan -T 10 -t ed25519,rsa "$BOX_IP" >> ~/.ssh/known_hosts 2>/dev/null
+          grep -q "$BOX_IP" ~/.ssh/known_hosts || { echo "::error::no SSH host key from $BOX_IP"; exit 1; }
+
+      - name: Install the release on the box
+        run: |
+          set -o pipefail
+          ssh_opts=(-i "$RUNNER_TEMP/box_key" -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o ServerAliveInterval=30)
+          home="/home/$BOX_USER"
+          scp "${ssh_opts[@]}" scripts/box-update.sh minisign.pub "$BOX_USER@$BOX_IP:$home/"
+          args=(--release-repo "$GITHUB_REPOSITORY" --pubkey-file "$home/minisign.pub")
+          if [[ -n "$TAG" ]]; then args+=(--tag "$TAG"); fi
+          ssh "${ssh_opts[@]}" "$BOX_USER@$BOX_IP" "bash $home/box-update.sh $(printf '%q ' "${args[@]}")" 2>&1 | tee "$RUNNER_TEMP/update.log"
+
+      - name: Report the installed release
+        run: |
+          result=$(tail -n 1 "$RUNNER_TEMP/update.log")
+          tag="${result#* }"
+          [[ "$tag" =~ ^server-v ]] || { echo "::error::unexpected result: $result"; exit 1; }
+          if [[ -n "$MXB_BOX_ENROLL_KEY" ]]; then
+            jq -n --arg t "$tag" '{tag:$t}' | curl -fsS -X POST "$API/v1/hosting/boxes/$BOX_ID/updated" \
+              -H "Authorization: Bearer $MXB_BOX_ENROLL_KEY" -H 'Content-Type: application/json' --data-binary @- >/dev/null
+          fi
+          echo "box $BOX_ID: $result"
+
+      - name: Remove the SSH key
+        if: ${{ always() }}
+        run: rm -f "$RUNNER_TEMP/box_key"
