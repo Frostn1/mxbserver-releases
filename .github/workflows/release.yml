@@ -8,7 +8,8 @@ name: Release
 #
 #   msm-v0.1.0      → MSM Windows installer (NSIS), Authenticode-signed, plus the updater's
 #                     signature (.sig) and a signed latest.json
-#   server-v0.1.0   → mxbserver Linux x86-64 binary, VERSION and SHA256SUMS
+#   server-v0.1.0   → mxbserver Linux x86-64 binary and Windows x64 exe (Authenticode-signed),
+#                     VERSION, SHA256SUMS and minisign signatures
 #   agent-v0.1.0    → mxb-agent: Windows x64 exe (Authenticode-signed), a zip of it with
 #                     install.ps1, a Linux x86-64 binary, and SHA256SUMS over all three
 #
@@ -192,9 +193,118 @@ jobs:
           $log = Join-Path $env:RUNNER_TEMP 'sign-windows.log'
           if (Test-Path $log) { Get-Content $log } else { Write-Host 'no sign-windows.log (the signing script never ran)' }
 
-  server:
-    name: mxbserver (Linux x86-64)
+  # mxbserver for Windows. Builds and Authenticode-signs the exe, then creates the server-v*
+  # release as a draft with it. The Linux job below adds the ELF, SHA256SUMS over every file and
+  # the minisign signatures, then publishes it. A half-made release is never public.
+  server-windows:
+    name: mxbserver (Windows x64)
     if: ${{ startsWith(github.ref_name, 'server-v') }}
+    runs-on: windows-latest
+    environment: code-signing
+    permissions:
+      contents: write # create the draft release in this repo with GITHUB_TOKEN
+      id-token: write # OIDC login for code signing
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      sha: ${{ steps.meta.outputs.sha }}
+      prerelease: ${{ steps.meta.outputs.prerelease }}
+    steps:
+      - name: Checkout release tooling
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Checkout mxbserver (private)
+        uses: actions/checkout@v4
+        with:
+          repository: Frostn1/mxbserver
+          ssh-key: ${{ secrets.MXBSERVER_DEPLOY_KEY }}
+          path: src
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Pick the source commit and version
+        id: meta
+        shell: bash
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          version="${TAG#server-v}"
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
+            echo "::error::'$TAG' is not server-v<major>.<minor>.<patch>[-pre]"
+            exit 1
+          fi
+          if git -C src rev-parse -q --verify "refs/tags/$TAG^{commit}" >/dev/null; then
+            git -C src checkout -q --detach "refs/tags/$TAG"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "sha=$(git -C src rev-parse --short=12 HEAD)" >> "$GITHUB_OUTPUT"
+          if [[ "$version" == *-* ]]; then echo "prerelease=true"; else echo "prerelease=false"; fi >> "$GITHUB_OUTPUT"
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build
+        working-directory: src
+        run: cargo build --release --locked -p mxbserver
+
+      - name: Set up Windows code signing
+        uses: ./.github/actions/artifact-signing
+        with:
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          azure-subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          endpoint: ${{ vars.ARTIFACT_SIGNING_ENDPOINT }}
+          account: ${{ vars.ARTIFACT_SIGNING_ACCOUNT }}
+          profile: ${{ vars.ARTIFACT_SIGNING_PROFILE }}
+          required: "true"
+
+      # Signed before it is hashed, so SHA256SUMS and the minisign signature carry the signed
+      # bytes. A release never ships an unsigned exe.
+      - name: Sign and check
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory dist | Out-Null
+          $exe = 'dist/mxbserver-x86_64-pc-windows-msvc.exe'
+          Copy-Item src/target/release/mxbserver.exe $exe
+          ./scripts/sign-windows.ps1 $exe
+          $sig = Get-AuthenticodeSignature $exe
+          if ($sig.Status -ne 'Valid') { throw "$exe is not validly signed: $($sig.Status)" }
+          & $exe --version
+          if ($LASTEXITCODE) { throw "$exe --version exited $LASTEXITCODE" }
+
+      - name: Create the release (draft)
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          VERSION: ${{ steps.meta.outputs.version }}
+          PRERELEASE: ${{ steps.meta.outputs.prerelease }}
+        run: |
+          flags=()
+          if [[ "$PRERELEASE" == "true" ]]; then flags+=(--prerelease); fi
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --draft \
+            --title "mxbserver $VERSION" \
+            --notes "mxbserver $VERSION (being built)" \
+            "${flags[@]}" \
+            dist/mxbserver-x86_64-pc-windows-msvc.exe
+
+      - name: Show Windows signing log
+        if: ${{ failure() }}
+        shell: pwsh
+        run: |
+          $log = Join-Path $env:RUNNER_TEMP 'sign-windows.log'
+          if (Test-Path $log) { Get-Content $log } else { Write-Host 'no sign-windows.log (the signing script never ran)' }
+
+  server:
+    name: mxbserver (Linux x86-64) and publish
+    needs: server-windows
     runs-on: ubuntu-latest
     permissions:
       contents: write # publish the release in this repo with GITHUB_TOKEN
@@ -262,13 +372,18 @@ jobs:
         run: cargo build --release --locked -p mxbserver
 
       - name: Package
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           mkdir dist
           elf=mxbserver-x86_64-unknown-linux-gnu.elf
           cp src/target/release/mxbserver "dist/$elf"
           file "dist/$elf" | grep -q 'ELF 64-bit.*x86-64'
           "dist/$elf" --version > dist/VERSION
-          (cd dist && sha256sum "$elf" VERSION > SHA256SUMS)
+          # The signed Windows exe from the draft release the Windows job made.
+          gh release download "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --dir dist \
+            --pattern mxbserver-x86_64-pc-windows-msvc.exe
+          (cd dist && sha256sum "$elf" mxbserver-x86_64-pc-windows-msvc.exe VERSION > SHA256SUMS)
           # Bike-set manifests: ids and check words only, no licensed payload. Box installs take
           # them from here. They are listed in SHA256SUMS, so the signature covers them.
           if compgen -G "src/config/bike-sets/*.toml" >/dev/null; then
@@ -295,36 +410,36 @@ jobs:
           trap 'rm -f "$keyfile"' EXIT
           elf=mxbserver-x86_64-unknown-linux-gnu.elf
           comment="mxbserver $TAG $SHA"
-          for f in SHA256SUMS "$elf"; do
+          for f in SHA256SUMS "$elf" mxbserver-x86_64-pc-windows-msvc.exe; do
             printf '%s\n' "$PASSWORD" | minisign -S -s "$keyfile" -m "dist/$f" -x "dist/$f.minisig" \
               -c "mxbserver release signature" -t "$comment" >/dev/null
           done
           if [[ -f minisign.pub ]]; then
             minisign -V -p minisign.pub -m dist/SHA256SUMS -x dist/SHA256SUMS.minisig >/dev/null
             minisign -V -p minisign.pub -m "dist/$elf" -x "dist/$elf.minisig" >/dev/null
+            minisign -V -p minisign.pub -m dist/mxbserver-x86_64-pc-windows-msvc.exe \
+              -x dist/mxbserver-x86_64-pc-windows-msvc.exe.minisig >/dev/null
             echo "signatures verify against minisign.pub"
           else
             echo "::warning::minisign.pub is not committed; signatures were not self-checked"
           fi
 
+      # Release notes: notes/<tag>.md in this repo when there is one, then the build line.
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
           VERSION: ${{ steps.meta.outputs.version }}
           SHA: ${{ steps.meta.outputs.sha }}
-          PRERELEASE: ${{ steps.meta.outputs.prerelease }}
         run: |
-          flags=()
-          if [[ "$PRERELEASE" == "true" ]]; then flags+=(--prerelease); fi
-          notes="mxbserver $VERSION for Linux x86-64 ($(cat dist/VERSION)). Built from mxbserver \`$SHA\`. Check the download with \`sha256sum -c SHA256SUMS\` and \`minisign -V -p minisign.pub -m SHA256SUMS\`."
-          gh release create "$TAG" \
-            --repo "$GITHUB_REPOSITORY" \
-            --verify-tag \
-            --title "mxbserver $VERSION" \
-            --notes "$notes" \
-            "${flags[@]}" \
-            dist/mxbserver-x86_64-unknown-linux-gnu.elf dist/mxbserver-x86_64-unknown-linux-gnu.elf.minisig             dist/VERSION dist/SHA256SUMS dist/SHA256SUMS.minisig dist/*.toml
+          notes="$RUNNER_TEMP/notes.md"
+          if [[ -f "notes/$TAG.md" ]]; then cat "notes/$TAG.md" > "$notes"; echo >> "$notes"; else : > "$notes"; fi
+          printf '%s\n' "mxbserver $VERSION for Linux x86-64 and Windows x64 ($(cat dist/VERSION)). The Windows exe is signed by Creste LLC. Built from mxbserver \`$SHA\`. Check the download with \`sha256sum -c SHA256SUMS --ignore-missing\` and \`minisign -V -p minisign.pub -m SHA256SUMS\`." >> "$notes"
+          gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" \
+            dist/mxbserver-x86_64-unknown-linux-gnu.elf dist/mxbserver-x86_64-unknown-linux-gnu.elf.minisig \
+            dist/mxbserver-x86_64-pc-windows-msvc.exe.minisig \
+            dist/VERSION dist/SHA256SUMS dist/SHA256SUMS.minisig dist/*.toml
+          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --notes-file "$notes" --draft=false
 
   # mxb-agent (apps/agent in the source). The Windows job builds and signs the exe, packs the
   # zip, and creates the release as a draft; the Linux job adds its binary and SHA256SUMS over
