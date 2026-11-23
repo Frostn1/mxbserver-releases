@@ -5,7 +5,7 @@ bots that ride the track, race from the gate, and make room when players join.
 
 ## 1. Download
 
-From the [latest mxbserver release](https://github.com/Frostn1/mxbserver-releases/releases/latest):
+From the newest `mxbserver` release on the [Releases page](https://github.com/Frostn1/mxbserver-releases/releases):
 
 | System | File |
 | --- | --- |
@@ -141,6 +141,22 @@ of the race start, set `race_starts = false` under `[ghost]`.
 
 Set `password` under `[server]`. Players type it when they join from the in-game browser.
 After 5 wrong tries an address is locked out for 10 minutes.
+
+## Welcome and repeating messages
+
+Greet each rider when they join, and post a line to everyone every few minutes:
+
+```toml
+[messages]
+greeting = ["Welcome to My MXB Server", "Be nice, no blocking"]
+
+[[messages.repeat]]
+text = "Join our Discord: discord.gg/yourcode"
+every_min = 15
+```
+
+Each line is up to 99 characters. Changes apply without a restart. In MXB Servers, the same
+settings are under Settings > Messages.
 
 ## Check it is running
 

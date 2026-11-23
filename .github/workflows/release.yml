@@ -425,6 +425,7 @@ jobs:
           fi
 
       # Release notes: notes/<tag>.md in this repo when there is one, then the build line.
+      # Never marked Latest: MXB Servers keeps the Latest badge on this repo.
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
@@ -439,7 +440,7 @@ jobs:
             dist/mxbserver-x86_64-unknown-linux-gnu.elf dist/mxbserver-x86_64-unknown-linux-gnu.elf.minisig \
             dist/mxbserver-x86_64-pc-windows-msvc.exe.minisig \
             dist/VERSION dist/SHA256SUMS dist/SHA256SUMS.minisig dist/*.toml
-          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --notes-file "$notes" --draft=false
+          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --notes-file "$notes" --draft=false --latest=false
 
   # mxb-agent (apps/agent in the source). The Windows job builds and signs the exe, packs the
   # zip, and creates the release as a draft; the Linux job adds its binary and SHA256SUMS over
