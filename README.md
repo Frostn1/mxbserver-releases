@@ -11,7 +11,7 @@ Open [Releases](../../releases):
 | Release | File | For |
 | --- | --- | --- |
 | `MXB Servers x.y.z` | `MXB-Servers-x.y.z-x64-setup.exe` | Windows 10/11 x64. Signed by Creste LLC. |
-| `mxbserver x.y.z` | `mxbserver-x86_64-pc-windows-msvc.exe` (signed by Creste LLC), `mxbserver-x86_64-unknown-linux-gnu.elf` (each + `.minisig`), `VERSION`, `SHA256SUMS`, `SHA256SUMS.minisig`, `oem-*.toml` bike sets | Windows 10/11 x64 and Linux x86-64 servers |
+| `mxbserver x.y.z` | `mxbserver-x86_64-pc-windows-msvc.exe` (signed by Creste LLC), `mxbserver-x86_64-unknown-linux-gnu.elf` (each + `.minisig`), `VERSION`, `SHA256SUMS`, `SHA256SUMS.minisig`, `oem-*.toml` bike sets (built in since 0.1.5; only for old `[bike_set]` configs) | Windows 10/11 x64 and Linux x86-64 servers |
 | `mxb-agent x.y.z` | `mxb-agent-windows-x64.zip` (signed exe + `install.ps1`), `mxb-agent-windows-x64.exe`, `mxb-agent-linux-x86_64`, `SHA256SUMS` | The helper next to an official MX Bikes dedicated server that MXB Servers installs and pairs |
 
 Running your own server with bots: [docs/dedicated-server-with-bots.md](docs/dedicated-server-with-bots.md).
